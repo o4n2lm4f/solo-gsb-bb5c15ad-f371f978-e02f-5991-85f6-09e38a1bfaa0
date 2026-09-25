@@ -16,6 +16,7 @@ services:
     build: .
     environment:
       REDIS_URL: redis://redis:6379/0
+      # 租约与按资源键的并发容量占用共用同一组 TTL 边界 / 默认值
       LEASE_MIN_TTL_MS: "100"
       LEASE_MAX_TTL_MS: "300000"
       LEASE_DEFAULT_TTL_MS: "10000"

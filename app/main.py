@@ -24,6 +24,10 @@ from .config import Settings, get_settings
 from .lua import (
     ACQUIRE_BATCH_LUA,
     ACQUIRE_LUA,
+    CAPACITY_ACQUIRE_LUA,
+    CAPACITY_RELEASE_LUA,
+    CAPACITY_RENEW_LUA,
+    CAPACITY_SET_LUA,
     DEPENDENCY_SET_LUA,
     DEPENDENCY_SNAPSHOT_LUA,
     LIMIT_CHECK_LUA,
@@ -41,6 +45,8 @@ from .schemas import (
     AcquiredLease,
     AcquireRequest,
     AcquireResponse,
+    CapacitySetRequest,
+    CapacitySetResponse,
     CheckedResultCommitRequest,
     DependencyReadyResponse,
     DependencySetRequest,
@@ -64,6 +70,12 @@ from .schemas import (
     ResultChangePage,
     ResultCommitRequest,
     ResultCommitResponse,
+    SlotAcquireRequest,
+    SlotAcquireResponse,
+    SlotReleaseRequest,
+    SlotReleaseResponse,
+    SlotRenewRequest,
+    SlotRenewResponse,
     TaskResultResponse,
     TransferRequest,
     TransferResponse,
@@ -92,6 +104,10 @@ async def lifespan(app: FastAPI):
         dependency_snapshot=redis.register_script(DEPENDENCY_SNAPSHOT_LUA),
         limit_check=redis.register_script(LIMIT_CHECK_LUA),
         dependency_set=redis.register_script(DEPENDENCY_SET_LUA),
+        capacity_set=redis.register_script(CAPACITY_SET_LUA),
+        slot_acquire=redis.register_script(CAPACITY_ACQUIRE_LUA),
+        slot_renew=redis.register_script(CAPACITY_RENEW_LUA),
+        slot_release=redis.register_script(CAPACITY_RELEASE_LUA),
     )
     yield
     await redis.aclose()
@@ -99,13 +115,15 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Lease & Rate Limit API",
-    version="1.8.0",
+    version="1.9.0",
     description=(
         "供多个工作进程协调独占任务的租约服务、基于 Redis Lua 的"
         "原子滑动窗口成本限流，租约凭据保护的任务结果提交，"
         "基于持久任务结果的前置依赖门禁，前置结果版本快照保护的"
-        "受保护结果提交，以及按全局写入顺序订阅已提交结果的"
-        "结果变更流（FastAPI + Redis Lua）"
+        "受保护结果提交，按全局写入顺序订阅已提交结果的"
+        "结果变更流，以及按资源键分配加权并发容量、"
+        "供多个工作进程共享有上限处理槽位的容量槽位服务"
+        "（FastAPI + Redis Lua）"
     ),
     lifespan=lifespan,
 )
@@ -158,6 +176,16 @@ def result_changes_key(settings: Settings) -> str:
 def dependency_key(settings: Settings, task_key: str) -> str:
     # 前置依赖定义（Redis List），与结果 / 租约共享前缀、独立命名空间
     return f"{settings.key_prefix}:deps:{task_key}"
+
+
+def capacity_key(settings: Settings, resource_key: str) -> str:
+    # 资源键并发容量配置（Redis String，无 TTL），沿用租约键前缀、独立命名空间
+    return f"{settings.key_prefix}:capacity:{resource_key}"
+
+
+def slots_key(settings: Settings, resource_key: str) -> str:
+    # 资源键的有效占用集合（Redis ZSet：member=凭据、score=到期毫秒）
+    return f"{settings.key_prefix}:slots:{resource_key}"
 
 
 # Stream 条目 ID 形如 "<毫秒时间>-<序号>"，直接作为分页游标
@@ -1087,4 +1115,238 @@ async def check_limit(
         remaining=remaining,
         reset_at_ms=reset_at_ms,
         retry_after_ms=retry_after_ms,
+    )
+
+
+# 按资源键分配加权并发容量 -------------------------------------------------------------
+
+
+@app.put(
+    "/v1/capacity/{resource_key:path}",
+    response_model=CapacitySetResponse,
+    tags=["capacity"],
+    summary="设置资源键的并发容量（低于当前有效占用量时拒绝，保留原配置）",
+    responses={
+        status.HTTP_409_CONFLICT: {"model": CapacitySetResponse},
+    },
+)
+async def set_capacity(
+    resource_key: str,
+    req: CapacitySetRequest,
+    response: Response,
+    scripts: ScriptsDep,
+    settings: SettingsDep,
+) -> CapacitySetResponse:
+    """设置（整体调整）某资源键允许的有效占用权重总量上限。
+
+    - 调整在**单个 Redis Lua 脚本**内基于服务器时间先清理过期占用、
+      核算当前有效占用量，再比较新容量：新容量**低于当前有效占用量**时返回
+      **409** `reason=below_active`，**不写入容量键、不动任何占用**，响应体
+      `capacity` 回带当前仍生效的旧配置（从未配置时为 `null`）。
+    - 新容量不低于有效占用量时原子写入新配置（容量键无 TTL，整体替换），
+      返回 200、生效容量与当前有效占用量 `active_weight`。
+    - 资源键必须先设置容量才能申请占用；未配置资源键的申请返回
+      **409** `not_configured`。
+    """
+    result = await scripts.capacity_set(
+        keys=[
+            capacity_key(settings, resource_key),
+            slots_key(settings, resource_key),
+        ],
+        args=[str(req.capacity)],
+    )
+    active_weight = int(result[-1])
+    if not result[0]:
+        response.status_code = status.HTTP_409_CONFLICT
+        old_capacity = result[2]
+        return CapacitySetResponse(
+            resource_key=resource_key,
+            configured=False,
+            capacity=int(old_capacity) if old_capacity is not None else None,
+            active_weight=active_weight,
+            reason=result[1],
+        )
+    return CapacitySetResponse(
+        resource_key=resource_key,
+        configured=True,
+        capacity=int(result[1]),
+        active_weight=active_weight,
+    )
+
+
+@app.post(
+    "/v1/capacity/slots/acquire",
+    response_model=SlotAcquireResponse,
+    tags=["capacity"],
+    summary="申请占用处理槽位（可声明权重，原子核算剩余容量，绝不超配）",
+    responses={
+        status.HTTP_429_TOO_MANY_REQUESTS: {"model": SlotAcquireResponse},
+        status.HTTP_409_CONFLICT: {"model": SlotAcquireResponse},
+    },
+)
+async def acquire_slot(
+    req: SlotAcquireRequest,
+    response: Response,
+    scripts: ScriptsDep,
+    settings: SettingsDep,
+) -> SlotAcquireResponse:
+    """按资源键申请一个带 TTL 的加权处理槽位，供多个工作进程共享有上限的容量。
+
+    - "按 Redis 服务器时间清理过期占用 → 读取容量 → 累计有效占用权重 →
+      判定剩余 → 写入新占用"由**单个 Lua 脚本**原子完成，同一资源键的并发申请
+      严格串行，**绝不超配**；容量不足时不写入任何占用。
+    - 申请可声明整数 `weight`（默认 1，例如批量条数 / GPU 卡数）；
+      `weight` 大于当前容量时永远无法满足，返回 **409**。
+    - 成功返回 **200**、本次占用的**独立凭据** `credential`（服务端生成，
+      不透明，仅用于续期 / 释放）与 `expires_at_ms`（Redis 服务器时钟）。
+    - 资源键未设置容量：返回 **409** `not_configured`；
+      剩余容量不足：返回 **429** `capacity_exhausted` 与 `retry_after_ms`
+      （至最早一笔占用到期），并携带标准 `Retry-After` 响应头（秒）。
+    - 占用到期后由后续操作按服务器时间自动清理，其槽位自动回收。
+    """
+    ttl = resolve_ttl(req.ttl_ms, settings)
+    nonce = uuid.uuid4().hex
+    ckey = capacity_key(settings, req.resource_key)
+    skey = slots_key(settings, req.resource_key)
+    result = await scripts.slot_acquire(
+        keys=[ckey, skey],
+        args=[str(req.weight), nonce, str(ttl)],
+    )
+
+    if result[0]:
+        # {1, 凭据, expires_at_ms, 剩余容量, 容量}
+        _, credential, expires_at, remaining, capacity = result
+        capacity = int(capacity)
+        remaining = int(remaining)
+        return SlotAcquireResponse(
+            acquired=True,
+            resource_key=req.resource_key,
+            credential=credential,
+            weight=req.weight,
+            expires_at_ms=int(expires_at),
+            capacity=capacity,
+            active_weight=capacity - remaining,
+            remaining=remaining,
+        )
+
+    reason = result[1]
+    # 未配置容量 -> 409（调用方须先 PUT 容量）
+    if reason == "not_configured":
+        response.status_code = status.HTTP_409_CONFLICT
+        return SlotAcquireResponse(
+            acquired=False,
+            resource_key=req.resource_key,
+            weight=req.weight,
+            reason=reason,
+        )
+
+    # capacity_exhausted：
+    # {0, reason, remaining, 最早到期, retry_after_ms, capacity}
+    remaining = int(result[2])
+    retry_after_ms = int(result[4])
+    capacity = int(result[5])
+    active_weight = capacity - remaining
+    # weight 超过容量上限：永远无法满足，按 409（而非可重试的 429）返回
+    if req.weight > capacity:
+        response.status_code = status.HTTP_409_CONFLICT
+        return SlotAcquireResponse(
+            acquired=False,
+            resource_key=req.resource_key,
+            weight=req.weight,
+            capacity=capacity,
+            active_weight=active_weight,
+            remaining=remaining,
+            reason="weight_exceeds_capacity",
+        )
+    # 瞬时剩余容量不足：429，可在最早一笔占用到期后重试
+    response.status_code = status.HTTP_429_TOO_MANY_REQUESTS
+    # 标准 Retry-After 以秒为单位，向上取整避免客户端过早重试
+    response.headers["Retry-After"] = str(max(1, math.ceil(retry_after_ms / 1000)))
+    return SlotAcquireResponse(
+        acquired=False,
+        resource_key=req.resource_key,
+        weight=req.weight,
+        capacity=capacity,
+        active_weight=active_weight,
+        remaining=remaining,
+        retry_after_ms=retry_after_ms,
+        reason=reason,
+    )
+
+
+@app.post(
+    "/v1/capacity/slots/renew",
+    response_model=SlotRenewResponse,
+    tags=["capacity"],
+    summary="续期占用（仅接受该占用的凭据，过期 / 旧凭据无效）",
+    responses={
+        status.HTTP_409_CONFLICT: {"model": SlotRenewResponse},
+    },
+)
+async def renew_slot(
+    req: SlotRenewRequest,
+    response: Response,
+    scripts: ScriptsDep,
+    settings: SettingsDep,
+) -> SlotRenewResponse:
+    """续期某个占用的到期时间。
+
+    - 续期只认申请时返回的**独立凭据**：脚本先按 Redis 服务器时间清理过期占用，
+      凭据对应的 member 仍存在才把到期时刻刷新为 `now + ttl_ms`。
+    - 凭据错误、或占用已过期（含被服务器清理）均返回 **409** `not_found`，
+      **不做任何修改**；过期 / 旧凭据的续期不可能影响过期后新申请的新占用。
+    """
+    ttl = resolve_ttl(req.ttl_ms, settings)
+    result = await scripts.slot_renew(
+        keys=[slots_key(settings, req.resource_key)],
+        args=[
+            req.credential,
+            str(ttl),
+            capacity_key(settings, req.resource_key),
+        ],
+    )
+    # 成功 {1, 'ok', expires_at_ms, remaining}；失败 {0, 'not_found', 0, remaining}
+    if result[0]:
+        return SlotRenewResponse(
+            renewed=True,
+            credential=req.credential,
+            expires_at_ms=int(result[2]),
+            remaining=int(result[3]),
+        )
+    response.status_code = status.HTTP_409_CONFLICT
+    return SlotRenewResponse(
+        renewed=False,
+        credential=req.credential,
+        remaining=int(result[3]),
+        reason=result[1],
+    )
+
+
+@app.post(
+    "/v1/capacity/slots/release",
+    response_model=SlotReleaseResponse,
+    tags=["capacity"],
+    summary="释放占用（仅接受该占用的凭据，幂等）",
+)
+async def release_slot(
+    req: SlotReleaseRequest,
+    scripts: ScriptsDep,
+    settings: SettingsDep,
+) -> SlotReleaseResponse:
+    """提前释放占用、归还其权重槽位。
+
+    - 只认申请时返回的**独立凭据**：脚本先按服务器时间清理过期占用，
+      凭据对应的 member 仍存在才删除并归还权重。
+    - 凭据错误或占用已过期时幂等忽略（`released=false`，`weight=0`），
+      旧持有者在占用过期后的释放不会误删新占用（新占用是全新凭据）。
+    """
+    result = await scripts.slot_release(
+        keys=[slots_key(settings, req.resource_key)],
+        args=[req.credential, capacity_key(settings, req.resource_key)],
+    )
+    # {是否释放(1/0), 释放权重, 剩余容量}
+    return SlotReleaseResponse(
+        released=bool(result[0]),
+        weight=int(result[1]),
+        remaining=int(result[2]),
     )

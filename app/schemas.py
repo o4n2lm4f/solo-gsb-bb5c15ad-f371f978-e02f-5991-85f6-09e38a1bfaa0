@@ -612,3 +612,149 @@ class CheckedResultCommitRequest(BaseModel):
                 f"snapshot must contain at most {DEPENDENCY_MAX_COUNT} entries"
             )
         return v
+
+
+# 按资源键分配并发容量 ----------------------------------------------------------------
+
+# 单个资源键允许配置的容量 / 单次申请声明的权重上限（权重单位）
+CAPACITY_MAX_VALUE = 1_000_000_000
+
+# 凭据形如 "<uuid32>:<weight>"，预留少量余量
+CREDENTIAL_MAX_LENGTH = 64
+
+ResourceKey = Annotated[str, Field(min_length=1, max_length=512)]
+Credential = Annotated[str, Field(min_length=1, max_length=CREDENTIAL_MAX_LENGTH)]
+
+
+class CapacitySetRequest(BaseModel):
+    """设置（整体调整）资源键的并发容量（整数权重上限）。"""
+
+    capacity: int = Field(
+        ge=1,
+        le=CAPACITY_MAX_VALUE,
+        examples=[10],
+        description=(
+            "该资源键允许的有效占用权重总量上限（正整数）。"
+            "调整为低于当前有效占用量的值会被拒绝（409），原配置保持不变。"
+        ),
+    )
+
+
+class CapacitySetResponse(BaseModel):
+    resource_key: str
+    configured: bool = Field(
+        description="true 表示容量已写入；false 表示被拒绝（低于当前有效占用量），原配置不变"
+    )
+    capacity: int | None = Field(
+        default=None,
+        description=(
+            "成功时为本次写入的容量；被拒绝时为当前仍生效的旧容量"
+            "（资源键从未配置时为 null）"
+        ),
+    )
+    active_weight: int = Field(
+        ge=0,
+        description="按 Redis 服务器时间清理过期占用后，当前有效占用的权重总量",
+    )
+    reason: str | None = Field(
+        default=None,
+        description="仅失败（409）时返回：below_active（新容量低于当前有效占用量）",
+    )
+
+
+class SlotAcquireRequest(BaseModel):
+    resource_key: ResourceKey = Field(
+        examples=["gpu-pool"],
+        description="容量资源键；多个工作进程按同一资源键共享有上限的处理槽位",
+    )
+    weight: int = Field(
+        default=1,
+        ge=1,
+        le=CAPACITY_MAX_VALUE,
+        examples=[1],
+        description="本次申请声明的占用权重（正整数）；不得大于当前容量，否则 409",
+    )
+    ttl_ms: int | None = Field(
+        default=None, gt=0, description="占用 TTL（毫秒），缺省使用服务端默认值"
+    )
+
+
+class SlotAcquireResponse(BaseModel):
+    acquired: bool = Field(description="是否申请成功（false 时 HTTP 状态码为 409）")
+    resource_key: str
+    credential: str | None = Field(
+        default=None,
+        description=(
+            "本次占用的独立凭据（服务端生成，仅成功时返回）；"
+            "续期 / 释放必须原样携带，过期或旧凭据不可用"
+        ),
+    )
+    weight: int = Field(ge=0, description="本次申请声明的占用权重")
+    expires_at_ms: int | None = Field(
+        default=None, description="到期时间（Redis 服务器时钟，Unix 毫秒）"
+    )
+    capacity: int | None = Field(
+        default=None, description="该资源键当前配置的容量；未配置时为 null"
+    )
+    active_weight: int = Field(
+        default=0, ge=0, description="清理过期占用后当前有效占用权重总量（不含被拒本次）"
+    )
+    remaining: int = Field(
+        default=0,
+        ge=0,
+        description="放行后剩余容量；超限时为不占用情况下的剩余值",
+    )
+    retry_after_ms: int = Field(
+        default=0,
+        ge=0,
+        description="仅容量不足时返回：建议等待毫秒数（至最早一笔占用到期）",
+    )
+    reason: str | None = Field(
+        default=None,
+        description=(
+            "仅失败（409）时返回：not_configured（资源键尚未设置容量）/ "
+            "capacity_exhausted（剩余容量不足）"
+        ),
+    )
+
+
+class SlotRenewRequest(BaseModel):
+    resource_key: ResourceKey
+    credential: Credential = Field(description="申请成功时返回的独立凭据（原样携带）")
+    ttl_ms: int | None = Field(
+        default=None, gt=0, description="新的 TTL（毫秒），缺省使用服务端默认值"
+    )
+
+
+class SlotRenewResponse(BaseModel):
+    renewed: bool
+    credential: str | None = Field(
+        default=None, description="回显请求携带的凭据；无效时也原样回显"
+    )
+    expires_at_ms: int | None = Field(
+        default=None, description="续期后的新到期时间（Redis 服务器时钟，Unix 毫秒）"
+    )
+    remaining: int = Field(
+        default=0, ge=0, description="续期后该资源键的剩余容量"
+    )
+    reason: str | None = Field(
+        default=None,
+        description="仅失败（409）时返回：not_found（凭据不存在或已过期）",
+    )
+
+
+class SlotReleaseRequest(BaseModel):
+    resource_key: ResourceKey
+    credential: Credential = Field(description="申请成功时返回的独立凭据（原样携带）")
+
+
+class SlotReleaseResponse(BaseModel):
+    released: bool = Field(
+        description="是否真正删除了占用；凭据不匹配 / 已过期时为 false（幂等）"
+    )
+    weight: int = Field(
+        default=0, ge=0, description="本次释放归还的占用权重（未释放为 0）"
+    )
+    remaining: int = Field(
+        default=0, ge=0, description="释放后该资源键的剩余容量"
+    )

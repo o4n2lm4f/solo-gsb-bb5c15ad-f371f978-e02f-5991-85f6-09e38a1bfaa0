@@ -39,7 +39,14 @@ snapshot 单脚本读定义与各前置结果版本（pending 不出快照 / 无
 commit-checked 与普通提交相同的凭据 / 防栅 / 幂等语义、
 前置版本漂移或定义变更 / 乱序 -> 409 stale_dependencies 且不改结果、
 重新拉快照后成功、空快照（含缺省字段）等价普通提交、
-快照参数校验 422、并发同内容恰好一次提交、stale_dependencies 落审计。
+快照参数校验 422、并发同内容恰好一次提交、stale_dependencies 落审计；
+以及按资源键分配并发容量：
+未配置即申请 409 not_configured / 设置容量 / 加权申请剩余递减 /
+容量不足 429 不占用且带 Retry-After / 权重超容量 409 /
+容量下调低于当前有效占用 409 below_active 且保留原配置 /
+续期仅认凭据（错误 / 过期 409 not_found，不能复活旧占用）/
+释放仅认凭据且幂等、旧凭据不影响新占用 / 短 TTL 过期自动回收且续期可延长 /
+参数校验 / 并发（含加权）绝不超配。
 """
 import json
 import sys
@@ -187,6 +194,7 @@ def main():
     limit_checks()
     dependency_checks()
     checked_commit_checks()
+    capacity_checks()
 
     print()
     if FAILED:
@@ -1897,6 +1905,273 @@ def checked_commit_checks():
           len(stale_events) >= 4
           and {e["fencing_token"] for e in stale_events} == {tfence, at2["fencing_token"]},
           f"{[(e['result'], e['fencing_token']) for e in stale_events]}")
+
+
+def capacity_checks():
+    """按资源键分配并发容量：
+    未配置拒绝申请 / 设置容量 / 加权申请剩余递减 / 超限 429 不占用且带
+    Retry-After / 权重超容量 409 / 容量下调低于有效占用 409 保留原配置 /
+    续期仅认凭据（错误 / 过期 409 not_found）/ 释放仅认凭据且幂等 /
+    过期与旧凭据不影响新占用 / 短 TTL 槽位回收 / 参数校验 /
+    并发绝不超配（40 并发恰好放行容量笔）。"""
+    base = f"smoke-cap:{int(time.time() * 1000)}"
+    acq_path = "/v1/capacity/slots/acquire"
+    renew_path = "/v1/capacity/slots/renew"
+    release_path = "/v1/capacity/slots/release"
+
+    def cap_path(rk):
+        return f"/v1/capacity/{rk}"
+
+    def set_cap(rk, capacity):
+        return call("PUT", cap_path(rk), {"capacity": capacity})
+
+    def acquire(rk, weight=1, ttl=None):
+        body = {"resource_key": rk, "weight": weight}
+        if ttl is not None:
+            body["ttl_ms"] = ttl
+        return call("POST", acq_path, body)
+
+    def acquire_h(rk, weight=1, ttl=None):
+        body = {"resource_key": rk, "weight": weight}
+        if ttl is not None:
+            body["ttl_ms"] = ttl
+        return call_ex("POST", acq_path, body)
+
+    def renew(rk, cred, ttl=None):
+        body = {"resource_key": rk, "credential": cred}
+        if ttl is not None:
+            body["ttl_ms"] = ttl
+        return call("POST", renew_path, body)
+
+    def release(rk, cred):
+        return call("POST", release_path, {"resource_key": rk, "credential": cred})
+
+    key = f"{base}:gpu"
+
+    # 未配置容量即申请 -> 409 not_configured
+    code, b = acquire(key)
+    check("cap acquire unconfigured -> 409",
+          code == 409 and b["acquired"] is False and b["reason"] == "not_configured",
+          f"{code} {b}")
+
+    # 参数校验：容量 0 / 负、权重 0 / 负、空资源键、缺凭据 -> 422
+    code, _ = set_cap(key, 0)
+    check("cap capacity zero -> 422", code == 422, f"code={code}")
+    code, _ = set_cap(key, -3)
+    check("cap capacity negative -> 422", code == 422, f"code={code}")
+    code, _ = acquire(key, weight=0)
+    check("cap weight zero -> 422", code == 422, f"code={code}")
+    code, _ = call("POST", acq_path, {"resource_key": "", "weight": 1})
+    check("cap empty resource_key -> 422", code == 422, f"code={code}")
+    code, _ = call("POST", renew_path, {"resource_key": key})
+    check("cap renew missing credential -> 422", code == 422, f"code={code}")
+    # ttl 越界 -> 400（与租约 / 限流一致，由 resolve_ttl 判定）
+    code, _ = acquire(key, ttl=999_999)
+    check("cap ttl out of range -> 400", code == 400, f"code={code}")
+
+    # 设置容量 3：回显容量与有效占用 0
+    code, b = set_cap(key, 3)
+    check("cap set ok",
+          code == 200 and b["configured"] is True and b["capacity"] == 3
+          and b["active_weight"] == 0 and b["reason"] is None, f"{code} {b}")
+
+    # 权重 1：剩余 2
+    code, a1 = acquire(key)
+    check("cap acquire w1",
+          code == 200 and a1["acquired"] and a1["weight"] == 1
+          and a1["remaining"] == 2 and a1["active_weight"] == 1
+          and a1["capacity"] == 3 and a1["credential"].endswith(":1")
+          and isinstance(a1["expires_at_ms"], int), f"{code} {a1}")
+    cred1 = a1["credential"]
+
+    # 权重 2：剩余 0
+    code, a2 = acquire(key, weight=2)
+    check("cap acquire w2 full",
+          code == 200 and a2["remaining"] == 0 and a2["active_weight"] == 3
+          and a2["credential"].endswith(":2"), f"{code} {a2}")
+    cred2 = a2["credential"]
+    check("cap credentials distinct", cred1 != cred2, f"{cred1} {cred2}")
+
+    # 容量已满：再申请权重 1 -> 429，不占用、带 Retry-After，剩余仍 0
+    code, headers, e = acquire_h(key)
+    check("cap exhausted -> 429",
+          code == 429 and e["acquired"] is False
+          and e["reason"] == "capacity_exhausted" and e["remaining"] == 0
+          and e["active_weight"] == 3 and e["retry_after_ms"] > 0,
+          f"{code} {e}")
+    check("cap exhausted Retry-After header",
+          headers.get("Retry-After") is not None
+          and int(headers["Retry-After"]) >= 1,
+          f"Retry-After={headers.get('Retry-After')}")
+
+    # 下调容量低于当前有效占用（3）-> 409 below_active，原配置 3 保留
+    code, b = set_cap(key, 2)
+    check("cap shrink below active -> 409",
+          code == 409 and b["configured"] is False and b["reason"] == "below_active"
+          and b["capacity"] == 3 and b["active_weight"] == 3, f"{code} {b}")
+    # 原配置仍为 3：依然满，申请还是 429（不是因为容量变成 2）
+    code, _ = acquire(key)
+    check("cap rejected shrink retains config", code == 429, f"code={code}")
+    # 下调到恰好等于有效占用 3 -> 允许
+    code, b = set_cap(key, 3)
+    check("cap resize equal active ok",
+          code == 200 and b["configured"] and b["capacity"] == 3
+          and b["active_weight"] == 3, f"{code} {b}")
+
+    # 权重本身超过容量（独立键 cap5 申请 9）-> 409 weight_exceeds_capacity（不可重试）
+    big_key = f"{base}:big"
+    code, _ = set_cap(big_key, 5)
+    code, b = acquire(big_key, weight=9)
+    check("cap weight exceeds capacity -> 409",
+          code == 409 and b["reason"] == "weight_exceeds_capacity"
+          and b["capacity"] == 5 and b["remaining"] == 5, f"{code} {b}")
+    # 被拒后容量未被占用：权重 5 可申请
+    code, b = acquire(big_key, weight=5)
+    check("cap after oversized denial usable",
+          code == 200 and b["remaining"] == 0, f"{code} {b}")
+    code, _ = release(big_key, b["credential"])
+
+    # 续期：错误凭据 -> 409 not_found，不动任何占用（容量仍满）
+    code, b = renew(key, "0" * 32 + ":1")
+    check("cap renew wrong credential -> 409",
+          code == 409 and b["renewed"] is False and b["reason"] == "not_found"
+          and b["credential"].endswith(":1"), f"{code} {b}")
+    # 正确凭据续期 -> 200，剩余仍为 0（占用权重不变）
+    code, b = renew(key, cred1)
+    check("cap renew ok",
+          code == 200 and b["renewed"] and b["expires_at_ms"]
+          and b["credential"] == cred1 and b["remaining"] == 0, f"{code} {b}")
+
+    # 释放权重 2 -> 剩余 2；伪造凭据释放无效且不影响真实占用
+    code, b = release(key, "0" * 32 + ":2")
+    check("cap release bogus ignored",
+          code == 200 and b["released"] is False and b["weight"] == 0
+          and b["remaining"] == 0, f"{code} {b}")
+    code, b = release(key, cred2)
+    check("cap release weight2",
+          code == 200 and b["released"] is True and b["weight"] == 2
+          and b["remaining"] == 2, f"{code} {b}")
+    # 此时再用伪造凭据 -> 剩余 2（cred1 权重 1 仍占用），released=false
+    code, b = release(key, "0" * 32 + ":1")
+    check("cap release bogus after free ignored",
+          code == 200 and b["released"] is False and b["weight"] == 0
+          and b["remaining"] == 2, f"{code} {b}")
+    # 释放权重 1 -> 剩余 3
+    code, b = release(key, cred1)
+    check("cap release weight1",
+          code == 200 and b["released"] is True and b["weight"] == 1
+          and b["remaining"] == 3, f"{code} {b}")
+    # 重复释放同一凭据 -> 幂等 false、归还 0
+    code, b = release(key, cred1)
+    check("cap release idempotent",
+          code == 200 and b["released"] is False and b["weight"] == 0
+          and b["remaining"] == 3, f"{code} {b}")
+
+    # 全部释放后允许把容量调小（当前有效占用为 0）
+    code, b = set_cap(key, 1)
+    check("cap shrink with zero active ok",
+          code == 200 and b["capacity"] == 1 and b["active_weight"] == 0,
+          f"{code} {b}")
+    # 新容量 1 下申请权重 2 -> 409
+    code, b = acquire(key, weight=2)
+    check("cap weight over resized capacity -> 409",
+          code == 409 and b["reason"] == "weight_exceeds_capacity"
+          and b["capacity"] == 1, f"{code} {b}")
+
+    # 短 TTL 过期：旧凭据续期 / 释放都不得影响过期后新申请的新占用
+    ttl_key = f"{base}:ttl"
+    code, _ = set_cap(ttl_key, 1)
+    code, s = acquire(ttl_key, ttl=300)
+    check("cap short ttl setup", code == 200 and s["acquired"], f"{code} {s}")
+    old_cred = s["credential"]
+    time.sleep(0.7)
+    # 旧凭据续期 -> not_found（不能复活旧占用）
+    code, b = renew(ttl_key, old_cred, ttl=5000)
+    check("cap renew expired credential -> 409",
+          code == 409 and b["reason"] == "not_found", f"{code} {b}")
+    # 过期槽位自动回收：可立即重新申请
+    code, s2 = acquire(ttl_key)
+    check("cap reacquire after expiry",
+          code == 200 and s2["acquired"] and s2["credential"] != old_cred
+          and s2["remaining"] == 0, f"{code} {s2}")
+    new_cred = s2["credential"]
+    # 旧凭据释放不得删掉新占用（released=false、剩余仍 0）
+    code, b = release(ttl_key, old_cred)
+    check("cap stale release cannot touch new",
+          code == 200 and b["released"] is False and b["weight"] == 0
+          and b["remaining"] == 0, f"{code} {b}")
+    # 新占用仍在：再申请 -> 429
+    code, _ = acquire(ttl_key)
+    check("cap new occupancy still held", code == 429, f"code={code}")
+    # 旧凭据续期也不影响新占用；新凭据自身可续期、可释放
+    code, _ = renew(ttl_key, old_cred)
+    check("cap stale renew cannot touch new", code == 409, f"code={code}")
+    code, b = renew(ttl_key, new_cred)
+    check("cap new credential renew ok", code == 200 and b["renewed"], f"{code} {b}")
+    code, b = release(ttl_key, new_cred)
+    check("cap new credential release ok",
+          code == 200 and b["released"] is True and b["weight"] == 1
+          and b["remaining"] == 1, f"{code} {b}")
+
+    # 续期延长有效期：短 TTL 占用在到期前续长，等待原 TTL 过后仍然有效
+    ext_key = f"{base}:extend"
+    code, _ = set_cap(ext_key, 1)
+    code, s = acquire(ext_key, ttl=300)
+    check("cap extend setup", code == 200, f"{code} {s}")
+    ext_cred = s["credential"]
+    time.sleep(0.2)
+    code, b = renew(ext_key, ext_cred, ttl=5000)
+    check("cap extend renew", code == 200 and b["renewed"], f"{code} {b}")
+    time.sleep(0.4)  # 已超过原始 300ms，但续到 5s：占用应仍在
+    code, _ = acquire(ext_key)
+    check("cap renewed occupancy survives original ttl", code == 429, f"code={code}")
+    code, _ = release(ext_key, ext_cred)
+
+    # 并发绝不超配：容量 10、权重 1，40 个并发申请恰好 10 个成功
+    conc_key = f"{base}:concurrent"
+    code, _ = set_cap(conc_key, 10)
+
+    def one_acquire(_):
+        return call("POST", acq_path, {"resource_key": conc_key, "weight": 1})
+
+    with ThreadPoolExecutor(max_workers=20) as pool:
+        results = list(pool.map(one_acquire, range(40)))
+    ok = [r for c, r in results if c == 200 and r["acquired"]]
+    no = [r for c, r in results if c == 429 and not r["acquired"]]
+    check("cap concurrent no over-admit",
+          len(ok) == 10 and len(no) == 30,
+          f"admitted={len(ok)} rejected={len(no)}")
+    check("cap concurrent distinct credentials",
+          len({r["credential"] for r in ok}) == 10, "credentials collided")
+    check("cap concurrent remaining consistent",
+          sorted(r["remaining"] for r in ok) == list(range(0, 10)),
+          f"{sorted(r['remaining'] for r in ok)}")
+    check("cap concurrent exhausted fields",
+          all(r["reason"] == "capacity_exhausted" and r["remaining"] == 0
+              for r in no), f"{no[:1]}")
+
+    # 加权并发不超配：容量 10，20 个权重 3 的并发，成功数 *3 <= 10 且再放不下一笔
+    w_key = f"{base}:weighted-conc"
+    code, _ = set_cap(w_key, 10)
+
+    def one_weighted(_):
+        return call("POST", acq_path, {"resource_key": w_key, "weight": 3})
+
+    with ThreadPoolExecutor(max_workers=20) as pool:
+        wresults = list(pool.map(one_weighted, range(20)))
+    wok = [r for c, r in wresults if c == 200]
+    wno = [r for c, r in wresults if c == 429]
+    used_total = len(wok) * 3
+    check("cap weighted concurrent no over-admit",
+          len(wok) == 3 and used_total == 9 and len(wno) == 17,
+          f"admitted={len(wok)} used={used_total} rejected={len(wno)}")
+    # 已用 9：权重 2 放不下（429），权重 1 恰好放下（200，剩余 0）
+    code, b = acquire(w_key, weight=2)
+    check("cap weighted leftover denies 2",
+          code == 429 and b["remaining"] == 1, f"{code} {b}")
+    code, b = acquire(w_key, weight=1)
+    check("cap weighted leftover fits 1",
+          code == 200 and b["remaining"] == 0, f"{code} {b}")
 
 
 if __name__ == "__main__":
