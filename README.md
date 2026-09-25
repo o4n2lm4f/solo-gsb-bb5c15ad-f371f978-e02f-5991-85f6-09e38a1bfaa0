@@ -23,6 +23,17 @@
 `client_key` + `request_id` 的并发或重试请求直接返回首次判定结果且不重复扣减，
 `request_id` 仅在对应窗口内存活，跨窗口可再次使用。
 
+还提供**按资源键分配并发容量的槽位 API**：多个工作进程按 `resource_key` 共享一个
+有上限的处理槽位池。先 `PUT /v1/slots/{resource_key}/capacity` 设置容量，再
+`POST /v1/slots/{resource_key}/acquire` 申请占用（可声明整数**权重** `weight`），
+由 **Redis Lua** 以服务器时间清理过期占用并原子核算剩余容量，返回独立**凭据**
+`credential` 与 `expires_at_ms`；并发申请绝不超配。`renew` / `release` 仅接受该笔
+占用自己的凭据，**旧凭据或已过期凭据不可能影响新占用**；占用到期后容量自动归还。
+调整容量时**不得低于当前有效占用量**，否则返回 `409` 且**原配置原样保留**。
+槽位键沿用租约的 `LEASE_KEY_PREFIX` 前缀（`:slot-cap:` / `:slots:` 命名空间），
+TTL 合法区间与缺省值复用 `LEASE_MIN_TTL_MS` / `LEASE_MAX_TTL_MS` /
+`LEASE_DEFAULT_TTL_MS`。
+
 还提供**任务结果提交 API**：`POST /v1/results/commit` 接收 `task_key`、`token`、
 `fencing_token` 与任意 JSON 结果，**租约校验与结果写入在同一个 Redis Lua 脚本内
 原子完成**，只有当前未过期租约的凭据可以提交，杜绝"校验后租约易主、旧持有者覆盖
@@ -89,9 +100,9 @@ Compose 会同时拉起 Redis 与 API 两个容器，API 等待 Redis 健康检�
 | --- | --- | --- |
 | `REDIS_URL` | `redis://localhost:6379/0` | Redis 连接串 |
 | `LEASE_KEY_PREFIX` | `lease` | Redis 键前缀，便于多环境共用实例 |
-| `LEASE_MIN_TTL_MS` | `100` | 允许的最小 TTL（毫秒） |
-| `LEASE_MAX_TTL_MS` | `300000` | 允许的最大 TTL（毫秒） |
-| `LEASE_DEFAULT_TTL_MS` | `10000` | 请求未指定 `ttl_ms` 时的默认值 |
+| `LEASE_MIN_TTL_MS` | `100` | 允许的最小 TTL（毫秒）；租约与并发槽位占用共用 |
+| `LEASE_MAX_TTL_MS` | `300000` | 允许的最大 TTL（毫秒）；租约与并发槽位占用共用 |
+| `LEASE_DEFAULT_TTL_MS` | `10000` | 请求未指定 `ttl_ms` 时的默认值（租约与槽位占用共用） |
 | `LEASE_EVENT_RETENTION` | `1000` | 每个任务键的租约审计 Stream 保留的最新事件条数；超出按最旧事件裁剪。`0` 表示不限制 |
 | `LEASE_RESULT_CHANGE_RETENTION` | `10000` | 全局任务结果变更 Stream（`/v1/results/changes`，所有任务键共用）保留的最新变更条数；超出按最旧变更裁剪。`0` 表示不限制 |
 | `LIMIT_KEY_PREFIX` | `ratelimit` | 限流 Redis 键前缀，与租约键隔离 |
@@ -124,6 +135,11 @@ Compose 会同时拉起 Redis 与 API 两个容器，API 等待 Redis 健康检�
 | GET | `/v1/dependencies/{task_key}/ready` | 门禁判定：所有直接前置任务均已提交持久结果则 `ready=true`，否则返回未完成键 `pending`；无定义视为可执行 |
 | GET | `/v1/dependencies/{task_key}/snapshot` | 单个只读 Lua 操作返回当前直接前置列表及各结果 `fencing_token`（按定义顺序）；全部完成返回可提交快照，有未完成前置返回 `pending`（不出快照），无定义返回空快照 |
 | POST | `/v1/limits/check` | 滑动窗口成本限流检查（通过即扣减，可选 `request_id` 幂等），放行 200 / 超限 429 |
+| PUT | `/v1/slots/{resource_key}/capacity` | 设置 / 调整资源键的并发容量（首次设置即初始化）；低于当前有效占用量 409 `below_used` 且保留原配置 |
+| POST | `/v1/slots/{resource_key}/acquire` | 申请占用（可声明 `weight`），原子核算剩余容量，成功 200 返回凭据与到期时间；未配置 409 `unconfigured`、超重 409 `weight_exceeds_capacity`、容量不足 409 `capacity_exhausted` |
+| POST | `/v1/slots/{resource_key}/renew` | 按凭据续期（沿用原权重）；凭据不存在或占用已过期 409 `not_found` |
+| POST | `/v1/slots/{resource_key}/release` | 按凭据释放占用并归还容量（幂等，凭据不匹配 / 已过期始终 200 `released=false`） |
+| GET | `/v1/slots/{resource_key}` | 查看容量、有效占用权重和、剩余容量与占用笔数（不暴露凭据） |
 | GET | `/healthz` | 健康检查 |
 
 ### 示例
@@ -629,6 +645,96 @@ curl -i -X POST localhost:8000/v1/limits/check \
 | `reset_at_ms` | 响应 | 窗口内最老一笔成本滑出、可再获配额的时刻（Redis 服务器时钟，Unix 毫秒） |
 | `retry_after_ms` | 响应 | 仅 429 时非 0：建议等待毫秒数；响应头同时给出标准 `Retry-After`（秒，向上取整） |
 
+### 并发容量槽位示例
+
+多个工作进程按**资源键**共享一个有上限的处理槽位池：先设置容量，再申请、续期、
+释放。占用带 TTL，崩溃不主动释放的槽位也会在到期后自动归还；每次申请可声明整数
+**权重**（如批量条数、需要的槽位数）。
+
+```bash
+# 1. 设置容量（首次调用即初始化；容量为有效占用权重和的上限，≥1）
+curl -s -X PUT localhost:8000/v1/slots/gpu-pool-a/capacity \
+  -H 'Content-Type: application/json' -d '{"capacity": 8}'
+# => 200 {"saved":true,"resource_key":"gpu-pool-a","capacity":8,
+#         "used":0,"active_count":0,"reason":null}
+
+# 2. 申请一个普通槽位（weight 默认 1，TTL 缺省 10 秒）
+curl -s -X POST localhost:8000/v1/slots/gpu-pool-a/acquire \
+  -H 'Content-Type: application/json' -d '{"ttl_ms": 60000}'
+# => 200
+# {"acquired":true,"resource_key":"gpu-pool-a",
+#  "credential":"426ed63ae5824c0fbadc3230e266bf5","weight":1,
+#  "capacity":8,"used":1,"remaining":7,"active_count":1,
+#  "expires_at_ms":1758...,"reason":null}
+
+# 3. 申请一个占用 3 个槽位的重任务
+curl -s -X POST localhost:8000/v1/slots/gpu-pool-a/acquire \
+  -H 'Content-Type: application/json' -d '{"weight": 3, "ttl_ms": 60000}'
+# => 200 {"acquired":true,...,"weight":3,"used":4,"remaining":4,"active_count":2,...}
+
+# 4. 容量不足时拒绝且不登记（并发申请同样绝不超配）
+curl -i -X POST localhost:8000/v1/slots/gpu-pool-a/acquire \
+  -H 'Content-Type: application/json' -d '{"weight": 5, "ttl_ms": 60000}'
+# => HTTP/1.1 409 Conflict
+# {"acquired":false,...,"weight":5,"capacity":8,"used":4,"remaining":4,
+#  "active_count":2,"reason":"weight_exceeds_capacity"}     # 单次权重高于容量
+# 剩余不足时 reason 为 "capacity_exhausted"；资源键未设置容量时为
+# "unconfigured"（此时 capacity/used 等字段为 null）
+
+# 5. 任务未完成前续期（只接受自己的凭据；权重保持申请时的值不变）
+curl -s -X POST localhost:8000/v1/slots/gpu-pool-a/renew \
+  -H 'Content-Type: application/json' \
+  -d '{"credential": "426ed63ae5824c0fbadc3230e266bf5", "ttl_ms": 60000}'
+# => 200 {"renewed":true,"expires_at_ms":1758...,"remaining":4,"used":4,
+#         "active_count":2,"reason":null}
+# 凭据不存在 / 占用已过期 => 409 {"renewed":false,...,"reason":"not_found"}
+
+# 6. 任务结束释放，容量立即归还；重复 / 错误凭据为幂等 no-op
+curl -s -X POST localhost:8000/v1/slots/gpu-pool-a/release \
+  -H 'Content-Type: application/json' \
+  -d '{"credential": "426ed63ae5824c0fbadc3230e266bf5"}'
+# => 200 {"released":true,"remaining":7,"used":1,"active_count":1}
+curl -s -X POST localhost:8000/v1/slots/gpu-pool-a/release \
+  -H 'Content-Type: application/json' -d '{"credential": "stale"}'
+# => 200 {"released":false,...}   # 不影响任何其他凭据的占用
+
+# 7. 查看容量与当前有效占用（不暴露凭据；先按服务器时间清理过期占用再核算）
+curl -s localhost:8000/v1/slots/gpu-pool-a
+# => {"resource_key":"gpu-pool-a","configured":true,"capacity":8,
+#     "used":1,"remaining":7,"active_count":1}
+# 从未设置容量 => {"configured":false,"capacity":null,"used":0,
+#                 "remaining":null,"active_count":0}
+
+# 8. 调整容量：不得低于当前有效占用量；被拒时原配置保留
+curl -i -X PUT localhost:8000/v1/slots/gpu-pool-a/capacity \
+  -H 'Content-Type: application/json' -d '{"capacity": 0}'
+# => 422（capacity 必须 ≥1）
+# 已存在 4 个有效占用时把容量降到 3：
+curl -i -X PUT localhost:8000/v1/slots/gpu-pool-a/capacity \
+  -H 'Content-Type: application/json' -d '{"capacity": 3}'
+# => HTTP/1.1 409 Conflict
+# {"saved":false,"resource_key":"gpu-pool-a","capacity":8,
+#  "used":4,"active_count":2,"reason":"below_used"}        # 容量仍为 8
+# 占用释放 / 过期后（used 下降）即可调小；等于当前有效占用量也允许。
+```
+
+字段与规则说明：
+
+| 字段 / 规则 | 方向 | 说明 |
+| --- | --- | --- |
+| `resource_key`（路径） | 请求 | 资源键（1～512 字符，允许 `/`，如 `gpu-pool-a`、`tenant-42/encode`）；同一资源键的所有工作进程共享容量，不同资源键互不影响 |
+| `capacity` | 请求 / 响应 | 容量上限（有效占用**权重和**的上限，1～1,000,000,000）。PUT 低于当前 `used` 返回 409 `below_used` 且不改配置 |
+| `weight` | 请求 / 响应 | 本次占用的权重（≥1，默认 1，≤1,000,000,000）；大于当前容量直接 409 `weight_exceeds_capacity`。续期不改变权重 |
+| `ttl_ms` | 请求 | 占用有效期（毫秒），区间复用 `LEASE_MIN_TTL_MS`～`LEASE_MAX_TTL_MS`（默认 100～300000），缺省取 `LEASE_DEFAULT_TTL_MS` |
+| `credential` | 请求 / 响应 | 申请成功时服务端签发的独立凭据（UUID hex）；续期 / 释放必须原样携带，仅能操作本凭据对应的占用 |
+| `acquired` | 响应 | 是否申请成功；失败时 HTTP 409 |
+| `used` | 响应 | 当前有效占用的权重和（申请成功为申请后的值，被拒为不登记情况下的值）；过期占用先按 Redis 服务器时间清理后核算 |
+| `remaining` | 响应 | 剩余可用容量（`capacity - used`） |
+| `active_count` | 响应 | 当前有效占用笔数（凭据数，与权重和相互独立） |
+| `expires_at_ms` | 响应 | 占用到期时间（Redis 服务器时钟，Unix 毫秒） |
+| `released` | 响应 | 释放是否真正删除了占用；凭据错误 / 已过期为 `false`（接口始终 200，幂等） |
+| `reason` | 响应 | 申请 409：`unconfigured` / `weight_exceeds_capacity` / `capacity_exhausted`；续期 409：`not_found`；调容 409：`below_used` |
+
 ## 设计要点
 
 - **原子性**：申请 / 批量申请 / 续租 / 批量续租 / 交接 / 释放 / 校验全部状态
@@ -777,6 +883,43 @@ curl -i -X POST localhost:8000/v1/limits/check \
   碰撞；`request_id` 仅允许字母、数字与 `._:-`，不携带 `request_id` 的请求
   行为与旧版本完全一致。
 
+### 并发容量槽位设计要点
+
+- **设置 / 申请 / 续期 / 释放全部单脚本原子**：每个资源键只有两个 Redis 键——
+  容量配置 `{prefix}:slot-cap:{resource_key}`（String，**无 TTL**）与占用集合
+  `{prefix}:slots:{resource_key}`（ZSet，score 为各占用的 `expires_at_ms`，
+  member 形如 `<credential>:<weight>`）。所有判定与写入都在同一个 Lua 脚本内
+  基于 Redis 服务器时间完成。
+- **服务器时间清理 + 原子核算，并发绝不超配**：申请脚本先
+  `ZREMRANGEBYSCORE` 清掉所有 `expires_at <= now` 的过期占用，再遍历 ZSet 从
+  member 尾部解析权重求和，仅当 `used + weight <= capacity` 时 `ZADD` 本笔。
+  Redis 单线程串行执行脚本，同一资源键的并发申请严格排队判定，**不可能超配**；
+  被拒请求不登记任何占用。容量未配置（`unconfigured`）、单次权重大于容量
+  （`weight_exceeds_capacity`）、剩余不足（`capacity_exhausted`）三类拒绝
+  语义各自区分。
+- **独立凭据，续期 / 释放只认本凭据**：凭据为申请时服务端生成的 UUID hex，
+  编码进 ZSet member 前缀 `<credential>:`，同毫秒并发也不会冲突。续期 / 释放
+  按此前缀精确定位本笔占用：续期沿用其原权重只顺延 score，释放只删除这一个
+  member。凭据错误、从未存在或占用**已过期被清**均为 `not_found`（续期 409）/
+  幂等忽略（释放 200 `released=false`）——旧持有者在到期后的任何操作都不可能
+  碰到属于新凭据的占用。
+- **调容不得低于有效占用量，拒绝保留原配置**：调容脚本同样先清过期再核算，
+  仅当 `new_capacity >= used` 时才 `SET`；否则返回 409 `below_used` 并回带
+  当前仍生效的旧容量与有效占用量，**不做任何写入**。等于有效占用量的收缩
+  允许；占用释放或过期导致 `used` 下降后即可进一步调小。首次 PUT 即为该资源
+  键初始化容量（upsert）。
+- **双重过期保障、无空集合残留**：member 的 score（`expires_at`）是容量核算
+  依据，申请 / 续期后另按集合中最晚到期时间给 ZSet 设置兜底 `PEXPIRE`；释放
+  清空或清理后集合为空时立即 `DEL`，不残留空 ZSet。容量配置键无 TTL，调容、
+  占用过期都不影响它。
+- **只读状态查询也走同一核算口径**：`GET /v1/slots/{resource_key}` 由 Lua
+  先清过期再返回 `capacity` / `used` / `remaining` / `active_count`，不暴露
+  任何凭据；未配置时 `configured=false`。
+- **沿用现有前缀与 TTL 配置**：槽位两键与租约 Hash / 限流键共享
+  `LEASE_KEY_PREFIX`（独立 `:slot-cap:` / `:slots:` 命名空间，互不影响）；
+  `ttl_ms` 的合法区间与缺省值复用 `LEASE_MIN_TTL_MS` / `LEASE_MAX_TTL_MS` /
+  `LEASE_DEFAULT_TTL_MS`，无需额外配置即可一条命令启动。
+
 ### Redis 数据模型
 
 | 键 | 类型 | 说明 |
@@ -789,6 +932,8 @@ curl -i -X POST localhost:8000/v1/limits/check \
 | `{prefix}:deps:{task_key}` | List（元素为前置任务键，去重、最多 16 个，按请求顺序；键不存在即无定义） | 任务依赖门禁定义；保存前 Lua 沿现有 List 做环检测（去重访问 ≤1024），拒绝保留原定义 |
 | `{limit_prefix}:{client_key}` | ZSet，score=请求毫秒时间戳，member=`<uuid>:<cost>`，带 PEXPIRE | 滑动窗口内各笔成本 |
 | `{idem_prefix}:<len>:{client_key}:{request_id}` | Hash（`allowed` / `remaining` / `reset_at` / `retry_after` / `limit` / `window`），PEXPIRE=首次 `window_ms` | request_id 首次判定的完整响应；窗口内回放、窗口结束自动删除 |
+| `{prefix}:slot-cap:{resource_key}` | String（容量整数），**无 TTL** | 资源键的并发容量配置；PUT 低于当前有效占用量时拒绝并保留原值 |
+| `{prefix}:slots:{resource_key}` | ZSet，score=`expires_at_ms`（Redis 服务器毫秒），member=`<credential>:<weight>`，按最晚到期 PEXPIRE 兜底、空集合即 DEL | 资源键的有效占用；申请先清过期再原子核算权重和，凭据隔离续期 / 释放，到期自动归还容量 |
 
 ## 冒烟测试
 
@@ -833,7 +978,12 @@ commit-checked 在同一 Lua 操作内核租约 + 前置列表 + 各结果版本
 全部一致才按普通提交的防栅与幂等语义写入，版本漂移 / 定义变更 / 乱序 /
 伪造版本均 409 `stale_dependencies` 且不改结果，重新拉快照后成功，
 空快照（含缺省字段）等价普通提交，快照参数 422，并发同内容恰好一次提交，
-拒绝尝试逐次落审计事件。
+拒绝尝试逐次落审计事件；以及**按资源键分配的并发容量槽位**：未设置容量不可
+申请、首次设置即初始化与调容保护（低于有效占用 409 `below_used` 且保留原配置，
+等于有效占用可缩，过期后可继续调小）、加权申请与剩余核算、超重 / 容量不足
+409 且不登记、**普通与加权并发都绝不超配**、续期仅认本凭据且沿用原权重、
+释放仅删本凭据占用且幂等、旧凭据 / 过期凭据不影响新占用、过期容量自动归还、
+空 ZSet 自动删除、资源键间容量隔离、TTL 与请求体参数校验。
 
 ## 本地开发（不用 Docker）
 
@@ -848,10 +998,10 @@ uvicorn app.main:app --reload --port 8000
 
 ```
 app/
-  config.py    # 环境变量配置（pydantic-settings，含审计流与全局结果变更流保留条数）
-  lua.py       # 申请/批量申请/续租/批量续租/交接/释放/校验七个租约 Lua 脚本（租约脚本内原子写审计 Stream）+ 租约凭据原子校验的结果提交脚本（普通提交与 commit-checked 共用同一租约校验头 / 幂等写入尾；首次写入新结果版本时同脚本原子追加全局结果变更流）+ 前置版本快照与受保护提交 Lua 脚本 + 滑动窗口限流（含 request_id 幂等）Lua 脚本 + 依赖保存（现有定义环检测 / 1024 节点上限）Lua 脚本
-  schemas.py   # 请求 / 响应模型（含审计事件分页、任务结果与全局结果变更分页模型、任务依赖门禁与前置版本快照模型）
-  main.py      # FastAPI 应用、路由、Redis 生命周期（含 /events 游标分页、任务结果提交 / 读取、/v1/results/changes 全局变更游标分页（410 过期游标）、依赖保存 / ready / snapshot 门禁、commit-checked 受保护提交）
+  config.py    # 环境变量配置（pydantic-settings，含审计流与全局结果变更流保留条数；槽位 TTL 复用租约 TTL 配置）
+  lua.py       # 申请/批量申请/续租/批量续租/交接/释放/校验七个租约 Lua 脚本（租约脚本内原子写审计 Stream）+ 租约凭据原子校验的结果提交脚本（普通提交与 commit-checked 共用同一租约校验头 / 幂等写入尾；首次写入新结果版本时同脚本原子追加全局结果变更流）+ 前置版本快照与受保护提交 Lua 脚本 + 滑动窗口限流（含 request_id 幂等）Lua 脚本 + 依赖保存（现有定义环检测 / 1024 节点上限）Lua 脚本 + 按资源键并发容量槽位（设置容量 / 申请 / 续期 / 释放 / 状态，服务器时间清过期 + 原子核算剩余）Lua 脚本
+  schemas.py   # 请求 / 响应模型（含审计事件分页、任务结果与全局结果变更分页模型、任务依赖门禁与前置版本快照模型、并发容量槽位模型）
+  main.py      # FastAPI 应用、路由、Redis 生命周期（含 /events 游标分页、任务结果提交 / 读取、/v1/results/changes 全局变更游标分页（410 过期游标）、依赖保存 / ready / snapshot 门禁、commit-checked 受保护提交、/v1/slots 并发容量槽位设置 / 申请 / 续期 / 释放 / 状态）
 scripts/
   smoke_test.py
 Dockerfile

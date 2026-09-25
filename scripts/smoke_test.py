@@ -39,7 +39,14 @@ snapshot 单脚本读定义与各前置结果版本（pending 不出快照 / 无
 commit-checked 与普通提交相同的凭据 / 防栅 / 幂等语义、
 前置版本漂移或定义变更 / 乱序 -> 409 stale_dependencies 且不改结果、
 重新拉快照后成功、空快照（含缺省字段）等价普通提交、
-快照参数校验 422、并发同内容恰好一次提交、stale_dependencies 落审计。
+快照参数校验 422、并发同内容恰好一次提交、stale_dependencies 落审计；
+以及按资源键分配的并发容量槽位：
+未设置容量不可申请 / 首次设置即初始化、后续为调整 / 加权申请与剩余核算 /
+容量不足与单次超重 409 且不登记 / 并发绝不超配（普通与加权）/
+续期仅接受本凭据且沿用原权重 / 释放仅删除本凭据占用且幂等 /
+旧凭据与过期凭据不影响新占用 / 过期占用按服务器时间自动释放容量 /
+缩容低于有效占用 409 below_used 且保留原配置（等于有效占用可缩）/
+状态查询字段 / TTL 参数与请求体校验。
 """
 import json
 import sys
@@ -187,6 +194,7 @@ def main():
     limit_checks()
     dependency_checks()
     checked_commit_checks()
+    slot_checks()
 
     print()
     if FAILED:
@@ -1897,6 +1905,273 @@ def checked_commit_checks():
           len(stale_events) >= 4
           and {e["fencing_token"] for e in stale_events} == {tfence, at2["fencing_token"]},
           f"{[(e['result'], e['fencing_token']) for e in stale_events]}")
+
+
+def slot_set(r, capacity):
+    return call("PUT", f"/v1/slots/{r}/capacity", {"capacity": capacity})
+
+
+def slot_acquire(r, weight=1, ttl_ms=None):
+    body = {"weight": weight}
+    if ttl_ms is not None:
+        body["ttl_ms"] = ttl_ms
+    return call("POST", f"/v1/slots/{r}/acquire", body)
+
+
+def slot_renew(r, credential, ttl_ms=None):
+    body = {"credential": credential}
+    if ttl_ms is not None:
+        body["ttl_ms"] = ttl_ms
+    return call("POST", f"/v1/slots/{r}/renew", body)
+
+
+def slot_release(r, credential):
+    return call("POST", f"/v1/slots/{r}/release", {"credential": credential})
+
+
+def slot_status(r):
+    return call("GET", f"/v1/slots/{r}")
+
+
+def slot_checks():
+    """/v1/slots：设置容量 / 加权申请 / 续期 / 释放 / 过期隔离 / 缩容保护 / 并发不超配。"""
+    base = f"smoke-slot:{int(time.time() * 1000)}"
+
+    # 未设置容量：状态 configured=false；申请 -> 409 unconfigured
+    r0 = f"{base}:unconfigured"
+    code, st = slot_status(r0)
+    check("slot unconfigured status",
+          code == 200 and st["configured"] is False and st["capacity"] is None
+          and st["used"] == 0 and st["remaining"] is None
+          and st["active_count"] == 0, f"{code} {st}")
+    code, a = slot_acquire(r0)
+    check("slot acquire unconfigured -> 409",
+          code == 409 and not a["acquired"] and a["reason"] == "unconfigured",
+          f"{code} {a}")
+
+    # 参数校验：capacity < 1 / weight < 1 / ttl 越界 / 凭据缺失 -> 422 或 400
+    code, _ = slot_set(r0, 0)
+    check("slot capacity <1 -> 422", code == 422, f"code={code}")
+    code, _ = slot_set(r0, 1_000_000_001)
+    check("slot capacity >max -> 422", code == 422, f"code={code}")
+    code, _ = slot_set(r0, 4)
+    check("slot first set ok", code == 200, f"code={code}")
+    code, _ = call("POST", f"/v1/slots/{r0}/acquire", {"weight": 0})
+    check("slot weight <1 -> 422", code == 422, f"code={code}")
+    code, _ = call("POST", f"/v1/slots/{r0}/acquire", {"weight": 5})
+    check("slot weight >capacity -> 409 (not 422)", code == 409, f"code={code}")
+    code, _ = call("POST", f"/v1/slots/{r0}/renew", {"credential": "x", "ttl_ms": 999_999})
+    check("slot renew ttl out of range -> 400", code == 400, f"code={code}")
+    code, _ = call("POST", f"/v1/slots/{r0}/renew", {"ttl_ms": 1000})
+    check("slot renew missing credential -> 422", code == 422, f"code={code}")
+    code, _ = call("POST", f"/v1/slots/{r0}/release", {})
+    check("slot release missing credential -> 422", code == 422, f"code={code}")
+
+    # 加权申请与剩余核算：容量 4，weight 1 + weight 3 占满
+    r = f"{base}:weighted"
+    code, s = slot_set(r, 4)
+    check("slot setup capacity",
+          code == 200 and s["saved"] and s["capacity"] == 4 and s["used"] == 0
+          and s["active_count"] == 0, f"{code} {s}")
+    code, a1 = slot_acquire(r, weight=1, ttl_ms=60_000)
+    check("slot acquire w1",
+          code == 200 and a1["acquired"] and a1["credential"]
+          and a1["weight"] == 1 and a1["used"] == 1 and a1["remaining"] == 3
+          and a1["active_count"] == 1 and a1["expires_at_ms"], f"{code} {a1}")
+    c1 = a1["credential"]
+    code, a3 = slot_acquire(r, weight=3, ttl_ms=60_000)
+    check("slot acquire w3 fills",
+          code == 200 and a3["acquired"] and a3["used"] == 4
+          and a3["remaining"] == 0 and a3["active_count"] == 2, f"{code} {a3}")
+    c3 = a3["credential"]
+    check("slot distinct credentials", c1 != c3, f"{c1} {c3}")
+
+    # 容量不足：409 capacity_exhausted，不登记任何占用
+    code, d = slot_acquire(r, weight=1, ttl_ms=60_000)
+    check("slot exhausted -> 409",
+          code == 409 and not d["acquired"]
+          and d["reason"] == "capacity_exhausted" and d["remaining"] == 0
+          and d["used"] == 4 and d["active_count"] == 2, f"{code} {d}")
+    code, st = slot_status(r)
+    check("slot denied acquire registered nothing",
+          code == 200 and st["used"] == 4 and st["active_count"] == 2
+          and st["remaining"] == 0, f"{code} {st}")
+
+    # 单次权重大于容量：409 weight_exceeds_capacity
+    code, d = slot_acquire(r, weight=5, ttl_ms=60_000)
+    check("slot weight exceeds capacity -> 409",
+          code == 409 and d["reason"] == "weight_exceeds_capacity"
+          and d["capacity"] == 4, f"{code} {d}")
+
+    # 续期：错误凭据 not_found（409）；正确凭据成功且权重不变
+    code, rn = slot_renew(r, "no-such-credential", ttl_ms=60_000)
+    check("slot renew bad credential -> 409 not_found",
+          code == 409 and not rn["renewed"] and rn["reason"] == "not_found"
+          and rn["used"] == 4 and rn["remaining"] == 0, f"{code} {rn}")
+    code, rn = slot_renew(r, c1, ttl_ms=60_000)
+    check("slot renew ok keeps weight",
+          code == 200 and rn["renewed"] and rn["expires_at_ms"]
+          and rn["used"] == 4 and rn["remaining"] == 0
+          and rn["active_count"] == 2, f"{code} {rn}")
+
+    # 释放：错误凭据幂等 released=false 且不影响占用；正确凭据立即归还容量
+    code, rel = slot_release(r, "no-such-credential")
+    check("slot release bad credential idempotent",
+          code == 200 and rel["released"] is False and rel["used"] == 4
+          and rel["active_count"] == 2, f"{code} {rel}")
+    code, rel = slot_release(r, c3)
+    check("slot release returns capacity",
+          code == 200 and rel["released"] is True and rel["used"] == 1
+          and rel["remaining"] == 3 and rel["active_count"] == 1, f"{code} {rel}")
+    code, rel = slot_release(r, c3)
+    check("slot double release idempotent",
+          code == 200 and rel["released"] is False and rel["used"] == 1
+          and rel["active_count"] == 1, f"{code} {rel}")
+    # 释放后空出的容量可被新申请使用
+    code, anew = slot_acquire(r, weight=3, ttl_ms=60_000)
+    check("slot capacity reusable after release",
+          code == 200 and anew["acquired"] and anew["remaining"] == 0, f"{code} {anew}")
+    slot_release(r, anew["credential"])
+    slot_release(r, c1)
+    code, st = slot_status(r)
+    check("slot empty after releases",
+          code == 200 and st["used"] == 0 and st["remaining"] == 4
+          and st["active_count"] == 0, f"{code} {st}")
+
+    # 过期隔离：旧占用过期后续期 / 释放均失效，不影响新占用
+    re_ = f"{base}:expiry"
+    slot_set(re_, 1)
+    code, old = slot_acquire(re_, weight=1, ttl_ms=300)
+    check("slot expiry setup", code == 200 and old["acquired"], f"{code} {old}")
+    oc = old["credential"]
+    time.sleep(0.7)
+    code, st = slot_status(re_)
+    check("slot expired usage reclaimed",
+          code == 200 and st["used"] == 0 and st["remaining"] == 1
+          and st["active_count"] == 0, f"{code} {st}")
+    code, rn = slot_renew(re_, oc, ttl_ms=60_000)
+    check("slot renew expired credential -> 409",
+          code == 409 and rn["reason"] == "not_found", f"{code} {rn}")
+    code, new = slot_acquire(re_, weight=1, ttl_ms=60_000)
+    check("slot acquire after expiry",
+          code == 200 and new["acquired"] and new["credential"] != oc,
+          f"{code} {new}")
+    nc = new["credential"]
+    code, rel = slot_release(re_, oc)
+    check("slot stale credential release ignored",
+          code == 200 and rel["released"] is False and rel["used"] == 1
+          and rel["active_count"] == 1, f"{code} {rel}")
+    code, rn = slot_renew(re_, nc, ttl_ms=60_000)
+    check("slot new credential renews after stale release",
+          code == 200 and rn["renewed"], f"{code} {rn}")
+    slot_release(re_, nc)
+
+    # 续期沿用原权重：weight 4 的占用续期后 used 仍为 4
+    rw = f"{base}:renew-weight"
+    slot_set(rw, 5)
+    code, a = slot_acquire(rw, weight=4, ttl_ms=60_000)
+    check("slot renew-weight setup", code == 200 and a["acquired"], f"{code} {a}")
+    code, rn = slot_renew(rw, a["credential"], ttl_ms=60_000)
+    check("slot renew keeps original weight",
+          code == 200 and rn["renewed"] and rn["used"] == 4
+          and rn["remaining"] == 1 and rn["active_count"] == 1, f"{code} {rn}")
+    slot_release(rw, a["credential"])
+
+    # 缩容保护：低于有效占用 -> 409 below_used 且原容量保留；等于有效占用可缩
+    rc = f"{base}:shrink"
+    slot_set(rc, 4)
+    a = slot_acquire(rc, weight=4, ttl_ms=60_000)[1]
+    code, d = slot_set(rc, 3)
+    check("slot shrink below used -> 409",
+          code == 409 and not d["saved"] and d["reason"] == "below_used"
+          and d["capacity"] == 4 and d["used"] == 4 and d["active_count"] == 1,
+          f"{code} {d}")
+    code, st = slot_status(rc)
+    check("slot shrink reject keeps config",
+          code == 200 and st["capacity"] == 4 and st["remaining"] == 0,
+          f"{code} {st}")
+    # 被拒期间占用不受影响：凭据仍可续期
+    code, rn = slot_renew(rc, a["credential"], ttl_ms=60_000)
+    check("slot occupancy untouched after rejected resize",
+          code == 200 and rn["renewed"], f"{code} {rn}")
+    code, d = slot_set(rc, 4)
+    check("slot resize equal to used ok",
+          code == 200 and d["saved"] and d["capacity"] == 4 and d["used"] == 4,
+          f"{code} {d}")
+    slot_release(rc, a["credential"])
+    code, d = slot_set(rc, 1)
+    check("slot shrink after release ok",
+          code == 200 and d["saved"] and d["capacity"] == 1, f"{code} {d}")
+    code, st = slot_status(rc)
+    check("slot shrink persisted",
+          code == 200 and st["capacity"] == 1 and st["remaining"] == 1
+          and st["used"] == 0, f"{code} {st}")
+    # 过期后缩容：短 TTL 占用过期，降到小于其原始权重的容量应成功
+    rce = f"{base}:shrink-expiry"
+    slot_set(rce, 10)
+    slot_acquire(rce, weight=10, ttl_ms=300)
+    time.sleep(0.7)
+    code, d = slot_set(rce, 2)
+    check("slot resize below expired usage ok",
+          code == 200 and d["saved"] and d["capacity"] == 2 and d["used"] == 0,
+          f"{code} {d}")
+
+    # 并发绝不超配：30 个 weight 1 并发、容量 10，恰好 10 个放行、凭据互不相同
+    rk = f"{base}:concurrent"
+    slot_set(rk, 10)
+
+    def one_slot(_):
+        return slot_acquire(rk, weight=1, ttl_ms=60_000)
+
+    with ThreadPoolExecutor(max_workers=30) as pool:
+        results = list(pool.map(one_slot, range(30)))
+    admitted = [d for code_, d in results if code_ == 200]
+    rejected = [d for code_, d in results if code_ == 409]
+    check("slot concurrent no over-admit",
+          len(admitted) == 10 and len(rejected) == 20
+          and len({d["credential"] for d in admitted}) == 10
+          and all(d["reason"] == "capacity_exhausted" for d in rejected),
+          f"admitted={len(admitted)} rejected={len(rejected)}")
+    check("slot concurrent remaining consistent",
+          sorted(d["remaining"] for d in admitted) == list(range(0, 10)),
+          f"{[d['remaining'] for d in admitted]}")
+    code, st = slot_status(rk)
+    check("slot concurrent totals",
+          code == 200 and st["used"] == 10 and st["active_count"] == 10
+          and st["remaining"] == 0, f"{code} {st}")
+
+    # 加权并发：40 个 weight 3、容量 10，恰好 3 个放行（占用 9，剩余 1）
+    rkw = f"{base}:concurrent-weighted"
+    slot_set(rkw, 10)
+
+    def one_weighted_slot(_):
+        return slot_acquire(rkw, weight=3, ttl_ms=60_000)
+
+    with ThreadPoolExecutor(max_workers=40) as pool:
+        wresults = list(pool.map(one_weighted_slot, range(40)))
+    wadmitted = [d for code_, d in wresults if code_ == 200]
+    wrejected = [d for code_, d in wresults if code_ == 409]
+    check("slot weighted concurrent no over-admit",
+          len(wadmitted) == 3 and len(wrejected) == 37
+          and all(d["reason"] == "capacity_exhausted" for d in wrejected),
+          f"admitted={len(wadmitted)} rejected={len(wrejected)}")
+    check("slot weighted usage values",
+          sorted(d["used"] for d in wadmitted) == [3, 6, 9]
+          and sorted(d["remaining"] for d in wadmitted) == [1, 4, 7],
+          f"{[(d['used'], d['remaining']) for d in wadmitted]}")
+    code, st = slot_status(rkw)
+    check("slot weighted totals",
+          code == 200 and st["used"] == 9 and st["remaining"] == 1
+          and st["active_count"] == 3, f"{code} {st}")
+
+    # 不同资源键容量互不影响
+    rx, ry = f"{base}:isolated-a", f"{base}:isolated-b"
+    slot_set(rx, 1)
+    slot_set(ry, 100)
+    slot_acquire(rx, weight=1, ttl_ms=60_000)
+    code, ay = slot_acquire(ry, weight=1, ttl_ms=60_000)
+    check("slot capacities isolated per resource key",
+          code == 200 and ay["acquired"] and ay["remaining"] == 99, f"{code} {ay}")
 
 
 if __name__ == "__main__":

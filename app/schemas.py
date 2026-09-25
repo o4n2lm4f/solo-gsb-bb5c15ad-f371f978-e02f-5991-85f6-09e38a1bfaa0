@@ -612,3 +612,143 @@ class CheckedResultCommitRequest(BaseModel):
                 f"snapshot must contain at most {DEPENDENCY_MAX_COUNT} entries"
             )
         return v
+
+
+# 并发容量槽位：单次申请允许声明的权重上限
+SLOT_WEIGHT_MAX = 1_000_000_000
+# 容量上限
+SLOT_CAPACITY_MAX = 1_000_000_000
+
+
+class SlotCapacityRequest(BaseModel):
+    """设置（调整）资源键的并发容量。"""
+
+    capacity: int = Field(
+        ge=1,
+        le=SLOT_CAPACITY_MAX,
+        examples=[8],
+        description="该资源键允许同时存在的占用权重总和上限（≥1）",
+    )
+
+
+class SlotAcquireRequest(BaseModel):
+    weight: int = Field(
+        default=1,
+        ge=1,
+        le=SLOT_WEIGHT_MAX,
+        examples=[1],
+        description="本次申请占用的权重（如处理槽位数 / 批量条数），不得超过容量",
+    )
+    ttl_ms: int | None = Field(
+        default=None, gt=0, description="占用 TTL（毫秒），缺省使用服务端默认值"
+    )
+
+
+class SlotAcquireResponse(BaseModel):
+    acquired: bool = Field(
+        description="true 表示已获得槽位；false 时 HTTP 状态码为 409"
+    )
+    resource_key: str
+    credential: str | None = Field(
+        default=None, description="占用凭据（UUID），仅成功时返回；续期 / 释放须携带"
+    )
+    weight: int | None = Field(default=None, description="本次占用的权重，仅成功时回带")
+    capacity: int | None = Field(
+        default=None, description="当前容量；未配置容量时为 null"
+    )
+    used: int | None = Field(
+        default=None, description="判定时（拒绝）或申请后（成功）的有效占用权重和"
+    )
+    remaining: int | None = Field(
+        default=None, ge=0, description="申请后剩余可用容量；被拒时为不扣减情况下的剩余值"
+    )
+    active_count: int | None = Field(
+        default=None, ge=0, description="当前有效占用笔数（凭据数）"
+    )
+    expires_at_ms: int | None = Field(
+        default=None, description="到期时间（Redis 服务器时钟，Unix 毫秒），仅成功时返回"
+    )
+    reason: str | None = Field(
+        default=None,
+        description=(
+            "仅失败（409）时返回：unconfigured（资源键尚未设置容量）/ "
+            "weight_exceeds_capacity（单次权重大于容量）/ "
+            "capacity_exhausted（剩余容量不足）"
+        ),
+    )
+
+
+class SlotRenewRequest(BaseModel):
+    credential: str = Field(
+        min_length=1, max_length=128, description="申请成功时服务端签发的占用凭据"
+    )
+    ttl_ms: int | None = Field(
+        default=None, gt=0, description="新的 TTL（毫秒），缺省使用服务端默认值"
+    )
+
+
+class SlotRenewResponse(BaseModel):
+    renewed: bool
+    expires_at_ms: int | None = None
+    remaining: int | None = Field(
+        default=None, ge=0, description="续期后（占用权重不变的）剩余可用容量"
+    )
+    used: int | None = Field(default=None, ge=0, description="当前有效占用权重和")
+    active_count: int | None = Field(default=None, ge=0, description="当前有效占用笔数")
+    reason: str | None = Field(
+        default=None,
+        description="失败原因：not_found（凭据不存在或占用已过期）/ conflict（凭据不匹配）",
+    )
+
+
+class SlotReleaseRequest(BaseModel):
+    credential: str = Field(min_length=1, max_length=128)
+
+
+class SlotReleaseResponse(BaseModel):
+    released: bool = Field(
+        description="是否真正删除了该占用；凭据不存在 / 已过期时为 false（幂等）"
+    )
+    remaining: int | None = Field(
+        default=None, ge=0, description="释放后剩余可用容量；未配置容量时为 null"
+    )
+    used: int | None = Field(default=None, ge=0, description="释放后有效占用权重和")
+    active_count: int | None = Field(default=None, ge=0, description="释放后有效占用笔数")
+
+
+class SlotStatusResponse(BaseModel):
+    """资源键容量与当前有效占用（不暴露任何凭据）。"""
+
+    resource_key: str
+    configured: bool = Field(description="是否已设置容量；false 时 capacity 为 null")
+    capacity: int | None = Field(default=None, description="当前容量；未配置时为 null")
+    used: int = Field(ge=0, description="当前有效占用权重和（过期占用已按服务器时间清理）")
+    remaining: int | None = Field(
+        default=None, ge=0, description="剩余可用容量；未配置时为 null"
+    )
+    active_count: int = Field(ge=0, description="当前有效占用笔数（凭据数）")
+
+
+class SlotCapacityResponse(BaseModel):
+    """设置容量的结果；被拒绝时回带当前仍生效的容量与有效占用量。"""
+
+    saved: bool = Field(
+        description="true 表示容量已更新；false 表示被拒绝，原容量保持不变"
+    )
+    resource_key: str
+    capacity: int | None = Field(
+        default=None,
+        description=(
+            "保存成功时为新容量；被拒绝时为当前仍生效的旧容量"
+            "（未配置容量时为 null）"
+        ),
+    )
+    used: int = Field(ge=0, description="当前有效占用权重和（调容前先清理过期占用）")
+    active_count: int = Field(ge=0, description="当前有效占用笔数")
+    reason: str | None = Field(
+        default=None,
+        description=(
+            "仅失败（409）时返回：below_used（新容量低于当前有效占用量，"
+            "原容量保持不变）"
+        ),
+    )

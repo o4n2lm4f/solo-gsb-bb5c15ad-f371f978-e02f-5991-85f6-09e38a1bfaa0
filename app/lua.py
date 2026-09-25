@@ -68,6 +68,22 @@
   因此一条变更恰好对应结果 Hash 的一次版本推进。
 - retention > 0 时以 XADD MAXLEN 精确裁剪，全局流只保留最新的 retention 条，
   超出部分从最旧变更丢弃；retention = 0 表示不限制。
+
+并发容量槽位约定（按资源键共享有上限的处理槽位）：
+- 容量配置是一个无 TTL 的 String：{prefix}:slot-cap:{resource_key}，
+  保存该资源键当前生效的容量上限；未配置（键不存在）即无法申请。
+- 占用集合是一个 ZSet：{prefix}:slots:{resource_key}，
+  score 为该笔占用的 expires_at（Redis 服务器毫秒），
+  member 形如 "<凭据 uuid>:<weight>"，凭据由服务端在申请时生成，
+  同毫秒并发也不会产生相同 member；权重编码在 member 尾部。
+- 申请时先按服务器时间 ZREMRANGEBYSCORE 清掉所有已过期占用，再把有效占用的
+  weight 求和，仅当 used + weight <= capacity 时 ZADD 本笔占用；并发申请由
+  Redis 单线程串行判定，绝不超配。容量未配置、权重超过容量或剩余不足均拒绝。
+- 续期 / 释放按 member 前缀 "<凭据>:" 精确定位本凭据：占用已过期会在清理时
+  被删除（此时按 not_found 处理），凭据不匹配为 conflict，
+  旧凭据或已过期凭据不可能碰到属于新凭据的 member。
+- 申请 / 续期后按集合中最晚的 expires_at 给 ZSet 设置 PEXPIRE 兜底回收；
+  释放清空集合时删除键，不残留空集合。容量配置键无 TTL，调容不影响占用。
 """
 
 # 租约审计公共函数：拼接到每个需要落账的租约脚本前。
@@ -786,4 +802,201 @@ if allowed == 1 then
   return {1, remaining, reset_at}
 end
 return {0, remaining, reset_at, retry_after}
+"""
+
+# 并发容量槽位公共头部：服务器时间、过期清理、有效占用量核算与 ZSet 兜底 TTL。
+# 约定 KEYS[1] = 容量配置键（String），KEYS[2] = 占用 ZSet 键。
+_SLOTS_HEAD_LUA = """
+local t = redis.call('TIME')
+local now = tonumber(t[1]) * 1000 + math.floor(tonumber(t[2]) / 1000)
+
+-- 清理已过期占用（score <= now），使容量核算只计当前有效占用
+redis.call('ZREMRANGEBYSCORE', KEYS[2], '-inf', now)
+
+-- 统计当前有效占用的权重总和（member 形如 "<credential>:<weight>"）
+local function slot_used()
+  local used = 0
+  local members = redis.call('ZRANGE', KEYS[2], 0, -1)
+  for _, m in ipairs(members) do
+    used = used + tonumber(string.match(m, ':(%d+)$'))
+  end
+  return used
+end
+
+-- 集合非空时按最晚过期时间设置兜底 PEXPIRE；为空则删除键，避免空集合残留
+local function slot_reschedule()
+  local latest = redis.call('ZREVRANGE', KEYS[2], 0, 0, 'WITHSCORES')
+  if #latest == 0 then
+    redis.call('DEL', KEYS[2])
+  else
+    redis.call('PEXPIRE', KEYS[2], tonumber(latest[2]) - now)
+  end
+end
+"""
+
+# 设置容量（upsert：首次设置即创建配置，后续为调整）：清理过期占用后核算
+# 有效占用量，已配置时新容量不得低于它；拒绝（below_used）发生在任何写入
+# 之前，原配置原样保留。
+# KEYS[1] = 容量配置键, KEYS[2] = 占用 ZSet 键
+# ARGV[1] = 新容量
+# 成功返回 {1, capacity, used, active_count, was_configured(1/0)}
+# 容量低于有效占用返回 {0, 'below_used', old_capacity, used, active_count}
+SLOT_SET_CAPACITY_LUA = _SLOTS_HEAD_LUA + """
+local new_capacity = tonumber(ARGV[1])
+local used = slot_used()
+local active = redis.call('ZCARD', KEYS[2])
+
+local stored = redis.call('GET', KEYS[1])
+if not stored then
+  -- 首次设置：当前不可能存在有效占用（有占用必有容量），直接创建
+  redis.call('SET', KEYS[1], new_capacity)
+  return {1, new_capacity, used, active, 0}
+end
+local old_capacity = tonumber(stored)
+if new_capacity < used then
+  return {0, 'below_used', old_capacity, used, active}
+end
+redis.call('SET', KEYS[1], new_capacity)
+return {1, new_capacity, used, active, 1}
+"""
+
+# 申请占用：清旧 -> 读容量 -> 核算有效占用 -> 判定 -> ZADD。
+# Redis 单线程执行整个脚本，同资源键的并发申请串行判定，绝不超配。
+# KEYS[1] = 容量配置键, KEYS[2] = 占用 ZSet 键
+# ARGV[1] = 新凭据（uuid hex）, ARGV[2] = weight, ARGV[3] = ttl_ms
+# 成功返回 {1, expires_at_ms, remaining, used_after, active_count}
+# 未配置返回 {0, 'unconfigured', 0, 0, 0, 0}
+# 权重超过容量返回 {0, 'weight_exceeds_capacity', capacity, remaining, used, active}
+# 剩余容量不足返回 {0, 'capacity_exhausted', capacity, remaining, used, active}
+SLOT_ACQUIRE_LUA = _SLOTS_HEAD_LUA + """
+local weight = tonumber(ARGV[2])
+local ttl = tonumber(ARGV[3])
+
+local stored = redis.call('GET', KEYS[1])
+if not stored then
+  return {0, 'unconfigured', 0, 0, 0, 0}
+end
+local capacity = tonumber(stored)
+local used = slot_used()
+local remaining = capacity - used
+local active = redis.call('ZCARD', KEYS[2])
+
+if weight > capacity then
+  return {0, 'weight_exceeds_capacity', capacity, remaining, used, active}
+end
+if used + weight > capacity then
+  return {0, 'capacity_exhausted', capacity, remaining, used, active}
+end
+
+local expires_at = now + ttl
+redis.call('ZADD', KEYS[2], expires_at, ARGV[1] .. ':' .. weight)
+slot_reschedule()
+return {1, expires_at, capacity - used - weight, used + weight, active + 1}
+"""
+
+# 续期：仅接受本凭据。先清旧再按 "<credential>:" 前缀精确定位 member，
+# 凭据不存在（从未存在或已过期被清）为 not_found，凭据正确但已过期则
+# 在清理时被一并删除（同样按 not_found），凭据不匹配的 member 不受影响；
+# 找到本凭据时沿用其原 weight，仅把 score 顺延为 now + ttl。
+# KEYS[1] = 容量配置键（预留，未使用）, KEYS[2] = 占用 ZSet 键
+# ARGV[1] = 凭据, ARGV[2] = ttl_ms
+# 成功返回 {1, expires_at_ms, remaining, used, active_count}
+# 未找到返回 {0, 'not_found', 0, remaining, used, active_count}
+SLOT_RENEW_LUA = _SLOTS_HEAD_LUA + """
+local ttl = tonumber(ARGV[2])
+local prefix = ARGV[1] .. ':'
+local used = slot_used()
+local active = redis.call('ZCARD', KEYS[2])
+local remaining_slot
+local stored = redis.call('GET', KEYS[1])
+if stored then
+  remaining_slot = tonumber(stored) - used
+else
+  remaining_slot = 0
+end
+
+local found = nil
+local found_weight = nil
+local members = redis.call('ZRANGE', KEYS[2], 0, -1)
+for _, m in ipairs(members) do
+  if string.sub(m, 1, string.len(prefix)) == prefix then
+    found = m
+    found_weight = tonumber(string.match(m, ':(%d+)$'))
+    break
+  end
+end
+if not found then
+  -- 从未存在或已过期（过期 member 已在头部清理）：旧凭据无法复活任何占用
+  return {0, 'not_found', 0, remaining_slot, used, active}
+end
+
+local expires_at = now + ttl
+redis.call('ZREM', KEYS[2], found)
+redis.call('ZADD', KEYS[2], expires_at, ARGV[1] .. ':' .. found_weight)
+slot_reschedule()
+if stored then
+  remaining_slot = tonumber(stored) - used
+end
+return {1, expires_at, remaining_slot, used, active}
+"""
+
+# 释放：仅删除本凭据对应的 member，找不到（从未存在 / 已过期被清 / 旧凭据）
+# 一律返回 released=0，绝不触碰其他凭据的占用；无论是否删除都顺带清理过期
+# 占用，并回带释放后的有效占用核算（未配置容量时 remaining 为 0）。
+# KEYS[1] = 容量配置键, KEYS[2] = 占用 ZSet 键
+# ARGV[1] = 凭据
+# 返回 {released(1/0), configured(1/0), remaining, used, active_count}
+# 未配置容量时 remaining 占位为 0，由调用方按 configured 转成 null
+SLOT_RELEASE_LUA = _SLOTS_HEAD_LUA + """
+local prefix = ARGV[1] .. ':'
+local released = 0
+local members = redis.call('ZRANGE', KEYS[2], 0, -1)
+for _, m in ipairs(members) do
+  if string.sub(m, 1, string.len(prefix)) == prefix then
+    redis.call('ZREM', KEYS[2], m)
+    released = 1
+    break
+  end
+end
+
+-- 删除本笔后重新核算（头部清理与本笔删除都已生效）；集合为空则删除键，
+-- 非空则把兜底 PEXPIRE 重排为剩余占用中的最晚到期时间
+local used = 0
+local rest = redis.call('ZRANGE', KEYS[2], 0, -1)
+for _, m in ipairs(rest) do
+  used = used + tonumber(string.match(m, ':(%d+)$'))
+end
+local active = #rest
+if active == 0 then
+  redis.call('DEL', KEYS[2])
+elseif released == 1 then
+  local latest = redis.call('ZREVRANGE', KEYS[2], 0, 0, 'WITHSCORES')
+  redis.call('PEXPIRE', KEYS[2], tonumber(latest[2]) - now)
+end
+local remaining = 0
+local configured = 0
+local stored = redis.call('GET', KEYS[1])
+if stored then
+  configured = 1
+  remaining = tonumber(stored) - used
+end
+return {released, configured, remaining, used, active}
+"""
+
+# 查询状态：只读语义下也先清理过期占用，再返回容量与当前有效占用核算。
+# KEYS[1] = 容量配置键, KEYS[2] = 占用 ZSet 键
+# 已配置返回 {1, capacity, used, remaining, active_count}
+# 未配置返回 {0, used, active_count}
+SLOT_STATUS_LUA = _SLOTS_HEAD_LUA + """
+local used = slot_used()
+local active = redis.call('ZCARD', KEYS[2])
+local stored = redis.call('GET', KEYS[1])
+if not stored then
+  if active == 0 then
+    redis.call('DEL', KEYS[2])
+  end
+  return {0, used, active}
+end
+local capacity = tonumber(stored)
+return {1, capacity, used, capacity - used, active}
 """
